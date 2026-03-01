@@ -146,7 +146,7 @@ async def log_measurement(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, days: int):
     chat_id = update.message.chat_id
     now_msk = datetime.now(MSK_TZ)
-    start_date = (now_msk - timedelta(days=days)).strftime('%Y-%m-%d 00:00')
+    start_date = (now_msk - timedelta(days=days - 1)).strftime('%Y-%m-%d 00:00')
     
     cursor.execute(
         "SELECT timestamp, measurement FROM records WHERE chat_id=? AND timestamp >= ? ORDER BY timestamp ASC", 
