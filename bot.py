@@ -14,11 +14,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Enable logging - only warnings and errors
+# Enable logging - only warnings and errors by default
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.WARNING
 )
 logger = logging.getLogger(__name__)
+
+# Show INFO level logs from this module (user actions), but not from libraries
+logger.setLevel(logging.INFO)
 
 # Suppress verbose logging from httpx and telegram libraries
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -68,6 +71,7 @@ def schedule_user_jobs(chat_id: int, context: ContextTypes.DEFAULT_TYPE | Applic
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
+    logger.info(f"User {chat_id} started the bot")
     cursor.execute(
         "INSERT OR IGNORE INTO schedule (chat_id, morning, day, evening) VALUES (?, ?, ?, ?)",
         (chat_id, DEFAULT_MORNING, DEFAULT_DAY, DEFAULT_EVENING),
@@ -105,6 +109,7 @@ async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str):
+    chat_id = update.message.chat_id
     if not context.args:
         await update.message.reply_text(
             f"Пожалуйста, укажите время. Пример: /set_{period} 08:30"
@@ -120,7 +125,7 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE, period: s
         )
         return
 
-    chat_id = update.message.chat_id
+    logger.info(f"User {chat_id} set {period} reminder to {time_str}")
     cursor.execute(
         f"UPDATE schedule SET {period}=? WHERE chat_id=?", (time_str, chat_id)
     )
@@ -135,6 +140,7 @@ async def set_time(update: Update, context: ContextTypes.DEFAULT_TYPE, period: s
 
 async def disable_time(update: Update, context: ContextTypes.DEFAULT_TYPE, period: str):
     chat_id = update.message.chat_id
+    logger.info(f"User {chat_id} disabled {period} reminder")
     cursor.execute(f"UPDATE schedule SET {period}=? WHERE chat_id=?", ("OFF", chat_id))
     conn.commit()
     schedule_user_jobs(chat_id, context)
@@ -177,6 +183,7 @@ async def log_measurement(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chat_id = update.message.chat_id
+    logger.info(f"User {chat_id} recorded measurement: {text}")
     now_msk = datetime.now(MSK_TZ)
     timestamp = now_msk.strftime("%Y-%m-%d %H:%M")
 
@@ -197,6 +204,7 @@ async def log_measurement(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, days: int):
     chat_id = update.message.chat_id
+    logger.info(f"User {chat_id} requested stats for {days} days")
 
     # First, find the latest record for this user
     cursor.execute(
