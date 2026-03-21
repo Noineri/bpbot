@@ -2,3 +2,7 @@ bp_tracker.db
 __pycache__/
 .env
 .venv/
+*.pdf
+*.png
+*.jpg
+!assets/*.png

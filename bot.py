@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from functools import partial
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest, TelegramError
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -33,6 +34,7 @@ from services import (
     classify_bp,
 )
 from pdf_report import generate_pdf_report
+from user_chart_v2 import generate_user_chart_v2
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -43,31 +45,37 @@ logger.setLevel(logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
+SCHEDULE_FIELD_SQL = {
+    "morning": "UPDATE schedule SET morning=? WHERE chat_id=?",
+    "day": "UPDATE schedule SET day=? WHERE chat_id=?",
+    "evening": "UPDATE schedule SET evening=? WHERE chat_id=?",
+}
+
 load_dotenv()
 
 
-def build_delete_callback(target: str, row_id: int, label: str) -> str:
-    return f"delete_{target}_{row_id}_{label}"
+def build_delete_callback(target: str, row_id: int) -> str:
+    return f"delete_{target}_{row_id}"
 
 
 def parse_delete_callback(data: str):
-    parts = data.split("_", 3)
-    if len(parts) != 4 or parts[0] != "delete":
+    parts = data.split("_", 2)
+    if len(parts) != 3 or parts[0] != "delete":
         return None
-    _, target, row_id, label = parts
+    _, target, row_id = parts
     if target not in {"bp", "med", "cancel"}:
         return None
     if target == "cancel":
-        return target, None, ""
+        return target, None
     if not row_id.isdigit():
         return None
-    return target, int(row_id), label
+    return target, int(row_id)
 
 
 async def safe_edit_or_reply(query, text: str, **kwargs):
     try:
         await query.edit_message_text(text, **kwargs)
-    except Exception:
+    except BadRequest:
         logger.warning("Не удалось отредактировать сообщение, отправляю новый ответ", exc_info=True)
         if query.message:
             await query.message.reply_text(text, **kwargs)
@@ -164,10 +172,7 @@ async def handle_waiting_input(
         try:
             datetime.strptime(text, "%H:%M")
             async with connect_db() as db:
-                await db.execute(
-                    f"UPDATE schedule SET {wait_mode}=? WHERE chat_id=?",
-                    (text, chat_id),
-                )
+                await db.execute(SCHEDULE_FIELD_SQL[wait_mode], (text, chat_id))
                 await db.commit()
             await schedule_user_jobs(chat_id, context)
             context.user_data.pop("waiting_for")
@@ -227,6 +232,27 @@ async def handle_waiting_input(
     return False
 
 
+START_KEYBOARD = InlineKeyboardMarkup([
+    [
+        InlineKeyboardButton("📊 График 7д", callback_data="cmd_chart_7"),
+        InlineKeyboardButton("📊 График 14д", callback_data="cmd_chart_14"),
+    ],
+    [
+        InlineKeyboardButton("📈 Стат. 3д", callback_data="cmd_stats_3"),
+        InlineKeyboardButton("📈 Стат. 7д", callback_data="cmd_stats_7"),
+    ],
+    [
+        InlineKeyboardButton("💊 Добавить", callback_data="cmd_med_add"),
+        InlineKeyboardButton("💊 Принять", callback_data="cmd_med_take"),
+    ],
+    [InlineKeyboardButton("📥 PDF-отчёт для врача", callback_data="export_pdf")],
+    [
+        InlineKeyboardButton("⏰ Напоминания", callback_data="cmd_settings"),
+        InlineKeyboardButton("🎯 Норма давления", callback_data="set_baseline"),
+    ],
+])
+
+
 # --- ОБРАБОТЧИКИ КОМАНД ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -237,9 +263,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await db.commit()
 
-    await schedule_user_jobs(chat_id, context)
-
-    await update.effective_message.reply_text(WELCOME_TEXT, parse_mode="HTML")
+    await update.effective_message.reply_text(
+        WELCOME_TEXT, parse_mode="HTML", reply_markup=START_KEYBOARD
+    )
 
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -362,9 +388,7 @@ async def universal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await query.edit_message_text("❌ Ошибка: неверное поле.")
                 return
             async with connect_db() as db:
-                await db.execute(
-                    f"UPDATE schedule SET {field}=? WHERE chat_id=?", ("OFF", chat_id)
-                )
+                await db.execute(SCHEDULE_FIELD_SQL[field], ("OFF", chat_id))
                 await db.commit()
             await schedule_user_jobs(chat_id, context)
             await query.edit_message_text("✅ Отключено.")
@@ -448,18 +472,24 @@ async def universal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await query.edit_message_text("❌ Некорректная команда удаления.")
                 return
 
-            target, rowid, label = parsed
+            target, rowid = parsed
             if target == "cancel":
                 await query.edit_message_text("❌ Отменено.")
                 return
 
             if target == "bp":
                 async with connect_db() as db:
+                    async with db.execute(
+                        "SELECT measurement FROM records WHERE id=? AND chat_id=?",
+                        (rowid, chat_id),
+                    ) as cursor:
+                        row = await cursor.fetchone()
                     cursor = await db.execute(
                         "DELETE FROM records WHERE id=? AND chat_id=?", (rowid, chat_id)
                     )
                     await db.commit()
                 if cursor.rowcount:
+                    label = row[0] if row else str(rowid)
                     await query.edit_message_text(f"🗑 Удалено: {label}")
                 else:
                     await query.edit_message_text("❌ Запись не найдена или уже удалена.")
@@ -467,11 +497,20 @@ async def universal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
             if target == "med":
                 async with connect_db() as db:
+                    async with db.execute(
+                        """SELECT m.name, m.dosage
+                        FROM med_intake mi
+                        JOIN medications m ON mi.med_id = m.id
+                        WHERE mi.id=? AND mi.chat_id=?""",
+                        (rowid, chat_id),
+                    ) as cursor:
+                        row = await cursor.fetchone()
                     cursor = await db.execute(
                         "DELETE FROM med_intake WHERE id=? AND chat_id=?", (rowid, chat_id)
                     )
                     await db.commit()
                 if cursor.rowcount:
+                    label = f"{row[0]} ({row[1]})" if row else str(rowid)
                     await query.edit_message_text(f"🗑 Удалён приём: {label}")
                 else:
                     await query.edit_message_text("❌ Запись не найдена или уже удалена.")
@@ -482,8 +521,68 @@ async def universal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await send_history_pdf(chat_id, context.bot)
             await query.edit_message_text("✅ Отчёт отправлен.")
 
+        elif data.startswith("cmd_"):
+            cmd = data[4:]  # chart_7, chart_14, stats_3, stats_7, med_add, med_take, settings
+            msg = query.message
+
+            if cmd in ("chart_7", "chart_14"):
+                days = 7 if cmd == "chart_7" else 14
+                start_dt = (datetime.now(MSK_TZ) - timedelta(days=days)).strftime("%Y-%m-%d 00:00")
+                async with connect_db() as db:
+                    async with db.execute(
+                        "SELECT timestamp, measurement, pulse, wellbeing FROM records WHERE chat_id=? AND timestamp >= ? ORDER BY timestamp ASC",
+                        (chat_id, start_dt),
+                    ) as cursor:
+                        bp_records = await cursor.fetchall()
+                    base_sys, base_dia, _is_auto = await extract_user_baseline_info(db, chat_id)
+                if not bp_records:
+                    await msg.reply_text("Нет данных за этот период.")
+                    return
+                chart_png = generate_user_chart_v2(bp_records, base_sys, base_dia, period_days=days)
+                if not chart_png:
+                    await msg.reply_text("Недостаточно данных для графика (нужно минимум 2 замера).")
+                    return
+                await msg.reply_photo(photo=io.BytesIO(chart_png), caption=f"📊 Давление за {days} дн.")
+
+            elif cmd in ("stats_3", "stats_7"):
+                days = 3 if cmd == "stats_3" else 7
+                fake_update = update
+                await get_stats(fake_update, context, days=days)
+
+            elif cmd == "med_add":
+                context.user_data["waiting_for"] = "med_name"
+                await msg.reply_text(
+                    "💊 <b>Добавление лекарства (шаг 1 из 3)</b>\n\nВведите название лекарства:",
+                    parse_mode="HTML",
+                )
+
+            elif cmd == "med_take":
+                async with connect_db() as db:
+                    async with db.execute(
+                        "SELECT id, name, dosage FROM medications WHERE chat_id=?", (chat_id,)
+                    ) as cursor:
+                        meds = await cursor.fetchall()
+                if not meds:
+                    await msg.reply_text("Список лекарств пуст. Добавьте через /med_add.")
+                    return
+                keyboard = [
+                    [InlineKeyboardButton(f"💊 {name} ({dose})", callback_data=f"take_{mid}")]
+                    for mid, name, dose in meds
+                ]
+                await msg.reply_text(
+                    "💊 <b>Отметить приём лекарства:</b>",
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                )
+
+            elif cmd == "settings":
+                await show_settings(update, context)
+
+    except TelegramError:
+        logger.exception("Telegram API ошибка в callback обработчике")
+        await safe_edit_or_reply(query, "❌ Произошла ошибка.")
     except Exception:
-        logger.exception("Ошибка в callback обработчике")
+        logger.exception("Неожиданная ошибка в callback обработчике")
         await safe_edit_or_reply(query, "❌ Произошла ошибка.")
 
 
@@ -619,9 +718,43 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, days: in
     await update.effective_message.reply_text(result, parse_mode="HTML")
 
 
+async def send_chart(update: Update, context: ContextTypes.DEFAULT_TYPE, days: int = 7):
+    chat_id = update.effective_chat.id
+    start_dt = (datetime.now(MSK_TZ) - timedelta(days=days)).strftime("%Y-%m-%d 00:00")
+
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT timestamp, measurement, pulse, wellbeing FROM records WHERE chat_id=? AND timestamp >= ? ORDER BY timestamp ASC",
+            (chat_id, start_dt),
+        ) as cursor:
+            bp_records = await cursor.fetchall()
+
+        base_sys, base_dia, _is_auto = await extract_user_baseline_info(db, chat_id)
+
+    if not bp_records:
+        await update.effective_message.reply_text("Нет данных за этот период.")
+        return
+
+    chart_png = generate_user_chart_v2(bp_records, base_sys, base_dia, period_days=days)
+    if not chart_png:
+        await update.effective_message.reply_text("Недостаточно данных для графика (нужно минимум 2 замера).")
+        return
+
+    await update.effective_message.reply_photo(
+        photo=io.BytesIO(chart_png),
+        caption=f"📊 Давление за {days} дн.",
+    )
+
+
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await send_history_pdf(chat_id, context.bot)
+
+
+async def export_period_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE, days: int):
+    chat_id = update.effective_chat.id
+    await update.effective_message.reply_text(f"📥 Готовлю PDF-отчёт за {days} дней...")
+    await send_history_pdf(chat_id, context.bot, days=days)
 
 
 async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -654,11 +787,10 @@ async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
 
     if has_bp:
-        bp_callback = build_delete_callback("bp", bp_row[0], bp_row[1])
+        bp_callback = build_delete_callback("bp", bp_row[0])
 
     if has_med:
-        med_label = f"{med_row[1]} ({med_row[2]})"
-        med_callback = build_delete_callback("med", med_row[0], med_label)
+        med_callback = build_delete_callback("med", med_row[0])
 
     if has_bp and has_med:
         keyboard = [
@@ -723,6 +855,11 @@ if __name__ == "__main__":
 
     application.add_handler(CommandHandler("stats_3", partial(get_stats, days=3)))
     application.add_handler(CommandHandler("stats_7", partial(get_stats, days=7)))
+    application.add_handler(CommandHandler("stats_30", partial(export_period_pdf, days=30)))
+    application.add_handler(CommandHandler("stats_90", partial(export_period_pdf, days=90)))
+
+    application.add_handler(CommandHandler("chart", partial(send_chart, days=7)))
+    application.add_handler(CommandHandler("chart_14", partial(send_chart, days=14)))
 
     application.add_handler(CallbackQueryHandler(universal_callback))
 

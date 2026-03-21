@@ -8,6 +8,11 @@ from config import DB_NAME
 
 logger = logging.getLogger(__name__)
 
+MIGRATABLE_TABLES = {
+    "records": "records_old",
+    "med_intake": "med_intake_old",
+}
+
 
 @asynccontextmanager
 async def connect_db():
@@ -28,6 +33,9 @@ async def _get_table_columns(db, table_name: str) -> list[str]:
 
 async def _migrate_legacy_table(db, table_name: str, create_sql: str, columns: list[str]):
     """Миграция старой таблицы без id в новый формат с AUTOINCREMENT."""
+    if table_name not in MIGRATABLE_TABLES:
+        raise ValueError(f"Недопустимое имя таблицы для миграции: {table_name}")
+
     existing = await _get_table_columns(db, table_name)
     if not existing or "id" in existing:
         return
@@ -37,7 +45,7 @@ async def _migrate_legacy_table(db, table_name: str, create_sql: str, columns: l
         logger.warning("Таблица %s: не хватает колонок для миграции, пропускаю", table_name)
         return
 
-    backup = f"{table_name}_old"
+    backup = MIGRATABLE_TABLES[table_name]
     await db.execute(f"ALTER TABLE {table_name} RENAME TO {backup}")
     await db.execute(create_sql)
 

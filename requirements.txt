@@ -4,3 +4,5 @@ pytz
 aiosqlite
 fpdf2
 matplotlib
+scipy
+Pillow

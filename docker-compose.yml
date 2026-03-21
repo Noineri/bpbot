@@ -1,0 +1,10 @@
+services:
+  bpbot:
+    build: .
+    container_name: bpbot
+    environment:
+      - TG_TOKEN=${TG_TOKEN}
+    volumes:
+      - bpbot_db:/app/db
+volumes:
+  bpbot_db:
