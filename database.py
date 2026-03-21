@@ -59,6 +59,7 @@ async def init_db():
             chat_id INTEGER NOT NULL,
             timestamp DATETIME NOT NULL,
             measurement TEXT NOT NULL,
+            pulse INTEGER,
             wellbeing TEXT
         )"""
         )
@@ -98,6 +99,24 @@ async def init_db():
         )"""
         )
 
+        # Миграция: добавляем колонку pulse, если её нет
+        records_cols = await _get_table_columns(db, "records")
+        if records_cols and "pulse" not in records_cols:
+            await db.execute("ALTER TABLE records ADD COLUMN pulse INTEGER")
+            # Извлекаем пульс из measurement (формат "120/80 65") в отдельную колонку
+            await db.execute(
+                """UPDATE records SET
+                pulse = CAST(SUBSTR(measurement, INSTR(measurement, ' ') + 1) AS INTEGER)
+                WHERE measurement LIKE '% %'"""
+            )
+            # Убираем пульс из measurement
+            await db.execute(
+                """UPDATE records SET
+                measurement = SUBSTR(measurement, 1, INSTR(measurement, ' ') - 1)
+                WHERE measurement LIKE '% %'"""
+            )
+            logger.info("Колонка pulse добавлена и данные мигрированы")
+
         # Миграция старых таблиц (без id) — только для records и med_intake,
         # у остальных таблиц PRIMARY KEY — chat_id, а не AUTOINCREMENT id.
         await _migrate_legacy_table(
@@ -107,9 +126,10 @@ async def init_db():
                 chat_id INTEGER NOT NULL,
                 timestamp DATETIME NOT NULL,
                 measurement TEXT NOT NULL,
+                pulse INTEGER,
                 wellbeing TEXT
             )""",
-            ["id", "chat_id", "timestamp", "measurement", "wellbeing"],
+            ["id", "chat_id", "timestamp", "measurement", "pulse", "wellbeing"],
         )
         await _migrate_legacy_table(
             db, "med_intake",

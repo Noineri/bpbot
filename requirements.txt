@@ -2,3 +2,5 @@ python-telegram-bot[job-queue]
 python-dotenv
 pytz
 aiosqlite
+fpdf2
+matplotlib

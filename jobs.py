@@ -168,7 +168,7 @@ async def send_weekly_report(context: ContextTypes.DEFAULT_TYPE):
             percent = round(count / total_feelings * 100) if total_feelings > 0 else 0
             report_lines.append(f"  {emoji} {name}: {count} раз ({percent}%)")
 
-    keyboard = [[InlineKeyboardButton("📥 Скачать все данные (CSV)", callback_data="export_csv")]]
+    keyboard = [[InlineKeyboardButton("📥 Скачать отчёт (PDF)", callback_data="export_pdf")]]
     try:
         await context.bot.send_message(
             chat_id=chat_id,

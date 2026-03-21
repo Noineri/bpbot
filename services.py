@@ -10,7 +10,7 @@ def build_history_csv(bp_records, med_records):
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["--- ЗАМЕРЫ ---"])
-    writer.writerow(["Дата и время", "Показания"])
+    writer.writerow(["Дата и время", "Показания", "Пульс"])
     writer.writerows(bp_records)
     writer.writerow([])
     writer.writerow(["--- ЛЕКАРСТВА ---"])

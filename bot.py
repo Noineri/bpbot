@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import logging
@@ -26,12 +27,12 @@ from config import (
 from database import connect_db, init_db
 from jobs import schedule_user_jobs
 from services import (
-    build_history_csv,
     get_user_baseline_info,
     extract_user_baseline_info,
     calculate_median_baseline,
     classify_bp,
 )
+from pdf_report import generate_pdf_report
 
 # --- ЛОГИРОВАНИЕ ---
 logging.basicConfig(
@@ -72,28 +73,47 @@ async def safe_edit_or_reply(query, text: str, **kwargs):
             await query.message.reply_text(text, **kwargs)
 
 
-async def send_history_csv(chat_id: int, bot):
+async def send_history_pdf(chat_id: int, bot, days: int = 0):
     async with connect_db() as db:
-        async with db.execute(
-            "SELECT timestamp, measurement FROM records WHERE chat_id=? ORDER BY timestamp ASC",
-            (chat_id,),
-        ) as cursor:
-            bp_records = await cursor.fetchall()
+        if days > 0:
+            start_dt = (datetime.now(MSK_TZ) - timedelta(days=days)).strftime("%Y-%m-%d 00:00")
+            bp_query = "SELECT timestamp, measurement, pulse, wellbeing FROM records WHERE chat_id=? AND timestamp >= ? ORDER BY timestamp ASC"
+            bp_params = (chat_id, start_dt)
+            med_query = """SELECT i.timestamp, m.name, m.dosage
+                FROM med_intake i
+                JOIN medications m ON i.med_id = m.id
+                WHERE i.chat_id=? AND i.timestamp >= ?
+                ORDER BY i.timestamp ASC"""
+            med_params = (chat_id, start_dt)
+        else:
+            bp_query = "SELECT timestamp, measurement, pulse, wellbeing FROM records WHERE chat_id=? ORDER BY timestamp ASC"
+            bp_params = (chat_id,)
+            med_query = """SELECT i.timestamp, m.name, m.dosage
+                FROM med_intake i
+                JOIN medications m ON i.med_id = m.id
+                WHERE i.chat_id=?
+                ORDER BY i.timestamp ASC"""
+            med_params = (chat_id,)
 
-        async with db.execute(
-            """SELECT i.timestamp, m.name, m.dosage
-            FROM med_intake i
-            JOIN medications m ON i.med_id = m.id
-            WHERE i.chat_id=?
-            ORDER BY i.timestamp ASC""",
-            (chat_id,),
-        ) as cursor:
+        async with db.execute(bp_query, bp_params) as cursor:
+            bp_records = await cursor.fetchall()
+        async with db.execute(med_query, med_params) as cursor:
             med_records = await cursor.fetchall()
 
+        base_sys, base_dia, is_auto = await extract_user_baseline_info(db, chat_id)
+
+    if not bp_records and not med_records:
+        await bot.send_message(chat_id=chat_id, text="Нет данных для отчёта.")
+        return
+
+    period_days = days if days > 0 else 0
+    pdf_bytes = generate_pdf_report(bp_records, med_records, base_sys, base_dia, is_auto, period_days)
+
+    filename = f"bp_report_{days}d.pdf" if days > 0 else "bp_report_all.pdf"
     await bot.send_document(
         chat_id=chat_id,
-        document=build_history_csv(bp_records, med_records),
-        filename="history.csv",
+        document=io.BytesIO(pdf_bytes),
+        filename=filename,
     )
 
 
@@ -164,7 +184,10 @@ async def handle_waiting_input(
             return True
         context.user_data["med_name"] = text
         context.user_data["waiting_for"] = "med_dose"
-        await update.effective_message.reply_text("Введите дозировку или напишите «отмена»:")
+        await update.effective_message.reply_text(
+            "💊 <b>Шаг 2 из 3:</b>\n\nВведите дозировку (например, 50 мг) или напишите «отмена»:",
+            parse_mode="HTML",
+        )
         return True
 
     if wait_mode == "med_dose":
@@ -176,7 +199,8 @@ async def handle_waiting_input(
         context.user_data["med_dose"] = text
         context.user_data["waiting_for"] = "med_time"
         await update.effective_message.reply_text(
-            "Введите время напоминания (ЧЧ:ММ) или напишите «отмена»:"
+            "💊 <b>Шаг 3 из 3:</b>\n\nВведите время напоминания (ЧЧ:ММ) или напишите «отмена»:",
+            parse_mode="HTML",
         )
         return True
 
@@ -257,7 +281,36 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def med_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["waiting_for"] = "med_name"
-    await update.effective_message.reply_text("Введите название лекарства:")
+    await update.effective_message.reply_text(
+        "💊 <b>Добавление лекарства (шаг 1 из 3)</b>\n\nВведите название лекарства:",
+        parse_mode="HTML",
+    )
+
+
+async def med_take(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    async with connect_db() as db:
+        async with db.execute(
+            "SELECT id, name, dosage FROM medications WHERE chat_id=?",
+            (chat_id,),
+        ) as cursor:
+            meds = await cursor.fetchall()
+
+    if not meds:
+        await update.effective_message.reply_text("Список лекарств пуст. Добавьте через /med_add.")
+        return
+
+    keyboard = []
+    for med_id, med_name, med_dosage in meds:
+        keyboard.append(
+            [InlineKeyboardButton(f"💊 {med_name} ({med_dosage})", callback_data=f"take_{med_id}")]
+        )
+
+    await update.effective_message.reply_text(
+        "💊 <b>Отметить приём лекарства:</b>",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
 
 
 async def med_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -424,11 +477,10 @@ async def universal_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await query.edit_message_text("❌ Запись не найдена или уже удалена.")
                 return
 
-        elif data == "export_csv":
-            await query.edit_message_text("📥 Подготовка файла...")
-
-            await send_history_csv(chat_id, context.bot)
-            await query.edit_message_text("✅ Файл отправлен.")
+        elif data == "export_pdf":
+            await query.edit_message_text("📥 Подготовка отчёта...")
+            await send_history_pdf(chat_id, context.bot)
+            await query.edit_message_text("✅ Отчёт отправлен.")
 
     except Exception:
         logger.exception("Ошибка в callback обработчике")
@@ -465,15 +517,13 @@ async def log_measurement(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = classify_bp(sys_val, dia_val, base_sys, base_dia)
 
     measurement_str = f"{sys_val}/{dia_val}"
-    if pulse:
-        measurement_str += f" {pulse}"
 
     keyboard = []
 
     async with connect_db() as db:
         await db.execute(
-            "INSERT INTO records (chat_id, timestamp, measurement, wellbeing) VALUES (?, ?, ?, NULL)",
-            (chat_id, timestamp, measurement_str),
+            "INSERT INTO records (chat_id, timestamp, measurement, pulse, wellbeing) VALUES (?, ?, ?, ?, NULL)",
+            (chat_id, timestamp, measurement_str, pulse or None),
         )
         async with db.execute("SELECT last_insert_rowid()") as cursor:
             row = await cursor.fetchone()
@@ -507,19 +557,15 @@ async def log_measurement(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     ]
 
-    async with connect_db() as db:
-        async with db.execute(
-            "SELECT id, name FROM medications WHERE chat_id=?", (chat_id,)
-        ) as med_cursor:
-            async for med_id, med_name in med_cursor:
-                wellbeing_keyboard.append(
-                    [InlineKeyboardButton(f"💊 Принял {med_name}", callback_data=f"take_{med_id}")]
-                )
-
     wellbeing_keyboard.extend(keyboard)
 
+    recorded_text = f"✅ <b>Записано:</b> {sys_val}/{dia_val}"
+    if pulse:
+        recorded_text += f" (пульс {pulse})"
+    recorded_text += f"\n📊 <b>Статус:</b> {status}\n\n💬 Как вы себя чувствуете?"
+
     await update.effective_message.reply_text(
-        f"✅ <b>Записано:</b> {sys_val}/{dia_val}\n📊 <b>Статус:</b> {status}\n\n💬 Как вы себя чувствуете?",
+        recorded_text,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup(wellbeing_keyboard),
     )
@@ -533,7 +579,7 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, days: in
 
     async with connect_db() as db:
         async with db.execute(
-            "SELECT timestamp, measurement, wellbeing FROM records WHERE chat_id=? AND timestamp >= ? ORDER BY timestamp ASC",
+            "SELECT timestamp, measurement, pulse, wellbeing FROM records WHERE chat_id=? AND timestamp >= ? ORDER BY timestamp ASC",
             (chat_id, start_dt),
         ) as cursor:
             bp_records = await cursor.fetchall()
@@ -555,9 +601,10 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, days: in
         return
 
     events = []
-    for timestamp, value, wellbeing in bp_records:
+    for timestamp, value, pulse, wellbeing in bp_records:
         feeling_emoji = feeling_map.get(wellbeing, "") if wellbeing else ""
-        events.append((timestamp, f"🔹 {timestamp[5:16]} — <b>{value}</b> {feeling_emoji}"))
+        pulse_str = f" 💓{pulse}" if pulse else ""
+        events.append((timestamp, f"🔹 {timestamp[5:16]} — <b>{value}</b>{pulse_str} {feeling_emoji}"))
     for timestamp, value in med_records:
         events.append((timestamp, f"💊 {timestamp[5:16]} — {value}"))
     events.sort(key=lambda x: x[0])
@@ -574,7 +621,7 @@ async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, days: in
 
 async def export_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await send_history_csv(chat_id, context.bot)
+    await send_history_pdf(chat_id, context.bot)
 
 
 async def delete_last(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -665,6 +712,7 @@ if __name__ == "__main__":
         ("start", start),
         ("settings", show_settings),
         ("med_add", med_add),
+        ("med_take", med_take),
         ("med_list", med_list),
         ("delete_last", delete_last),
         ("export", export_data),
